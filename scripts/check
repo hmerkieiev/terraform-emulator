@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Read the applied resources back and require the shape that was asked for.
+
+The emulator does not evaluate the trust the way AWS does. This checks the
+document, not the denial.
+"""
+
+import json
+import subprocess
+import sys
+import urllib.parse
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def aws(*args):
+    try:
+        raw = subprocess.check_output(
+            ["aws", *args, "--output", "json"],
+            text=True,
+            stderr=subprocess.PIPE,
+        )
+    except subprocess.CalledProcessError as exc:
+        sys.stderr.write(exc.stderr)
+        raise SystemExit(exc.returncode) from exc
+    return json.loads(raw)
+
+
+def as_doc(value):
+    if isinstance(value, str):
+        return json.loads(urllib.parse.unquote(value))
+    return value
+
+
+def as_list(value):
+    if isinstance(value, str):
+        return [value]
+    return list(value)
+
+
+def fail(message):
+    raise SystemExit(message)
+
+
+def main():
+    outputs = json.loads(
+        subprocess.check_output(
+            ["terraform", f"-chdir={ROOT / 'terraform'}", "output", "-json"],
+            text=True,
+        )
+    )
+
+    def out(name):
+        return outputs[name]["value"]
+
+    identity = aws("sts", "get-caller-identity")
+    if identity.get("Account") != "000000000000":
+        fail("caller is not the emulator")
+
+    repository = aws(
+        "ecr",
+        "describe-repositories",
+        "--repository-names",
+        out("repository_name"),
+    )["repositories"][0]
+    if repository.get("imageTagMutability") != "IMMUTABLE":
+        fail("repository tags are mutable")
+    scanning = repository.get("imageScanningConfiguration") or {}
+    if scanning.get("scanOnPush") is not True:
+        fail("scan on push is off")
+
+    block = aws(
+        "s3api",
+        "get-public-access-block",
+        "--bucket",
+        out("bucket_name"),
+    )["PublicAccessBlockConfiguration"]
+    for key in (
+        "BlockPublicAcls",
+        "IgnorePublicAcls",
+        "BlockPublicPolicy",
+        "RestrictPublicBuckets",
+    ):
+        if block.get(key) is not True:
+            fail(f"public access block {key} is not set")
+
+    trust = as_doc(
+        aws("iam", "get-role", "--role-name", out("role_name"))["Role"][
+            "AssumeRolePolicyDocument"
+        ]
+    )
+    statements = trust.get("Statement") or []
+    if len(statements) != 1:
+        fail("trust has more than one statement")
+    statement = statements[0]
+    condition = statement.get("Condition") or {}
+    if set(condition) != {"StringEquals"}:
+        fail("trust condition is not an exact match")
+    equals = condition["StringEquals"]
+    if equals.get("token.actions.githubusercontent.com:sub") != out("subject"):
+        fail("trust subject is not this repository and main")
+    if equals.get("token.actions.githubusercontent.com:aud") != "sts.amazonaws.com":
+        fail("trust audience is wrong")
+    if "*" in json.dumps(trust):
+        fail("trust contains a wildcard")
+
+    policy = as_doc(
+        aws(
+            "iam",
+            "get-role-policy",
+            "--role-name",
+            out("role_name"),
+            "--policy-name",
+            out("policy_name"),
+        )["PolicyDocument"]
+    )
+    bucket = out("bucket_name")
+    allowed = {
+        repository["repositoryArn"],
+        f"arn:aws:s3:::{bucket}",
+        f"arn:aws:s3:::{bucket}/*",
+    }
+    for item in policy.get("Statement") or []:
+        actions = as_list(item.get("Action"))
+        resources = as_list(item.get("Resource"))
+        if resources == ["*"]:
+            if actions != ["ecr:GetAuthorizationToken"]:
+                fail("wildcard resource is not limited to the registry login")
+            continue
+        if not set(resources) <= allowed:
+            fail("policy names a resource outside the registry and the bucket")
+        if any("*" in action for action in actions):
+            fail("policy action is a wildcard")
+
+    print("shape ok")
+
+
+if __name__ == "__main__":
+    main()

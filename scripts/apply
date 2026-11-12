@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# Apply the stack to a local emulator and read the resources back.
+# The caller has to be the emulator's account before Terraform runs.
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+cd "$ROOT"
+
+PORT=9297
+ENDPOINT="https://127.0.0.1:${PORT}"
+EMULATOR_DIR="${HOME}/.aws/emulator/${PORT}"
+CONTAINER=terraform-emulator
+# Fingerprint published for the SSM Publishing key that signs the package.
+SIGNING_FINGERPRINT="98BCF336A3BE53B734E967C52E5BF49BD940F624"
+TERRAFORM_VERSION=1.14.3
+
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE AWS_DEFAULT_PROFILE
+export AWS_ENDPOINT_URL="${ENDPOINT}"
+export AWS_SHARED_CREDENTIALS_FILE="${EMULATOR_DIR}/emulator_credentials"
+export AWS_CONFIG_FILE="${EMULATOR_DIR}/config"
+export AWS_CA_BUNDLE="${EMULATOR_DIR}/ca.pem"
+export AWS_EC2_METADATA_DISABLED=true
+export AWS_DISABLE_HOST_PREFIX_INJECTION=true
+export AWS_REGION=us-east-1
+export AWS_DEFAULT_REGION=us-east-1
+export EMULATOR_TELEMETRY=off
+export TF_IN_AUTOMATION=1
+export PATH="${HOME}/.local/bin:${PATH}"
+
+started=""
+emu_pid=""
+
+cleanup() {
+  if [[ "${started}" == "native" && -n "${emu_pid}" ]]; then
+    kill "${emu_pid}" >/dev/null 2>&1 || true
+    wait "${emu_pid}" >/dev/null 2>&1 || true
+  elif [[ "${started}" == "docker" ]]; then
+    docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+ready() {
+  [[ -f "${AWS_CA_BUNDLE}" && -f "${AWS_SHARED_CREDENTIALS_FILE}" ]] \
+    && curl -sf --cacert "${AWS_CA_BUNDLE}" "${ENDPOINT}/__admin/health" >/dev/null
+}
+
+wait_ready() {
+  local _i
+  for _i in $(seq 40); do
+    if ready; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "emulator did not become ready" >&2
+  return 1
+}
+
+install_terraform() {
+  if command -v terraform >/dev/null 2>&1; then
+    return
+  fi
+  local os arch tmp
+  case "$(uname -s)" in
+    Linux) os=linux ;;
+    Darwin) os=darwin ;;
+    *) echo "unsupported operating system" >&2; exit 1 ;;
+  esac
+  case "$(uname -m)" in
+    x86_64) arch=amd64 ;;
+    aarch64 | arm64) arch=arm64 ;;
+    *) echo "unsupported architecture" >&2; exit 1 ;;
+  esac
+  tmp=$(mktemp -d)
+  curl -fsSLo "${tmp}/terraform.zip" \
+    "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_${os}_${arch}.zip"
+  unzip -q "${tmp}/terraform.zip" -d "${tmp}"
+  mkdir -p "${HOME}/.local/bin"
+  mv "${tmp}/terraform" "${HOME}/.local/bin/terraform"
+}
+
+install_linux_package() {
+  local tmp fingerprint deb_arch
+  case "$(uname -m)" in
+    x86_64) deb_arch=amd64 ;;
+    aarch64 | arm64) deb_arch=arm64 ;;
+    *) echo "unsupported architecture" >&2; exit 1 ;;
+  esac
+  tmp=$(mktemp -d)
+  GNUPGHOME=$(mktemp -d)
+  chmod 700 "${GNUPGHOME}"
+  export GNUPGHOME
+  curl -fsSLo "${tmp}/aws-emulator.deb" \
+    "https://downloads.aws.com/aws-emulator/packages/aws-emulator/LTS/latest/aws-emulator_${deb_arch}.deb"
+  curl -fsSLo "${tmp}/aws-emulator.deb.sig" \
+    "https://downloads.aws.com/aws-emulator/packages/aws-emulator/LTS/latest/aws-emulator_${deb_arch}.deb.sig"
+  curl -fsSLo "${tmp}/aws-publishing.asc" \
+    "https://downloads.aws.com/keys/gpg/current.asc"
+  gpg --batch --import "${tmp}/aws-publishing.asc"
+  fingerprint=$(gpg --fingerprint ssm-publishing@amazon.com | tr -d '[:space:]')
+  if [[ "${fingerprint}" != *"${SIGNING_FINGERPRINT}"* ]]; then
+    echo "unexpected package signing key" >&2
+    exit 1
+  fi
+  gpg --batch --verify "${tmp}/aws-emulator.deb.sig" "${tmp}/aws-emulator.deb"
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${tmp}/aws-emulator.deb"
+}
+
+build_image() {
+  local arch tmp
+  case "$(uname -m)" in
+    x86_64) arch=x86_64 ;;
+    aarch64 | arm64) arch=aarch64 ;;
+    *) echo "unsupported architecture" >&2; exit 1 ;;
+  esac
+  if docker image inspect aws-emulator >/dev/null 2>&1; then
+    return
+  fi
+  tmp=$(mktemp -d)
+  cat >"${tmp}/Dockerfile" <<EOF
+FROM public.ecr.aws/amazonlinux/amazonlinux:2023-minimal
+ADD https://downloads.aws.com/aws-emulator/packages/aws-emulator/LTS/latest/aws-emulator-${arch}.rpm /tmp/aws-emulator.rpm
+RUN rpm -i /tmp/aws-emulator.rpm && rm /tmp/aws-emulator.rpm \\
+ && mkdir -p /home/emulator && chown 1000 /home/emulator
+USER 1000
+ENV HOME=/home/emulator
+ENV EMULATOR_TELEMETRY=off
+EXPOSE ${PORT}
+ENTRYPOINT ["aws-emulator", "-b", "0.0.0.0"]
+EOF
+  docker build -t aws-emulator "${tmp}"
+}
+
+run_container() {
+  mkdir -p "${HOME}/.aws/emulator"
+  docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
+  docker run --name "${CONTAINER}" --rm --memory=2g --memory-swap=2g \
+    -p "127.0.0.1:${PORT}:${PORT}" \
+    -e HOME="${HOME}" \
+    -e EMULATOR_TELEMETRY=off \
+    -v "${HOME}/.aws/emulator:${HOME}/.aws/emulator" \
+    aws-emulator -p "${PORT}"
+}
+
+if ready; then
+  echo "emulator already listening on ${PORT}"
+else
+  if command -v aws-emulator >/dev/null 2>&1; then
+    aws-emulator -p "${PORT}" >/tmp/terraform-emulator.log 2>&1 &
+    emu_pid=$!
+    started=native
+  elif [[ "$(uname -s)" == "Linux" ]]; then
+    install_linux_package
+    aws-emulator -p "${PORT}" >/tmp/terraform-emulator.log 2>&1 &
+    emu_pid=$!
+    started=native
+  else
+    build_image
+    started=docker
+    run_container >/tmp/terraform-emulator.log 2>&1 &
+  fi
+  if ! wait_ready; then
+    echo "emulator log:" >&2
+    tail -n 40 /tmp/terraform-emulator.log >&2 || true
+    exit 1
+  fi
+fi
+
+account=$(aws sts get-caller-identity --query Account --output text)
+if [[ "${account}" != "000000000000" ]]; then
+  echo "refusing to apply: caller is not the emulator" >&2
+  exit 1
+fi
+
+install_terraform
+terraform -chdir=terraform init -input=false
+terraform -chdir=terraform apply -input=false -auto-approve
+python3 scripts/check
+terraform -chdir=terraform plan -input=false -detailed-exitcode
+echo "apply ok"
