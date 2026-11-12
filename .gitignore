@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .terraform/
+.lambda/
 *.tfstate
 *.tfstate.*
 crash.log

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Read the applied resources back and require the shape that was asked for.
 
-The emulator does not evaluate the trust the way AWS does. This checks the
-document, not the denial.
+The emulator does not evaluate the CI role's trust the way AWS does. This
+checks the documents, not the denials. It also does not treat a certificate
+status or an SES verification as proof: the emulator does not issue or verify
+those the way an account does.
 """
 
 import json
@@ -12,6 +14,9 @@ import urllib.parse
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+NAME = "terraform-emulator"
+DNS = "terraform-emulator.test"
+ACCOUNT = "000000000000"
 
 
 def aws(*args):
@@ -43,6 +48,11 @@ def fail(message):
     raise SystemExit(message)
 
 
+def expect(got, want, label):
+    if got != want:
+        fail(f"{label}: got {got!r}")
+
+
 def main():
     outputs = json.loads(
         subprocess.check_output(
@@ -55,8 +65,7 @@ def main():
         return outputs[name]["value"]
 
     identity = aws("sts", "get-caller-identity")
-    if identity.get("Account") != "000000000000":
-        fail("caller is not the emulator")
+    expect(identity.get("Account"), ACCOUNT, "caller")
 
     repository = aws(
         "ecr",
@@ -64,26 +73,33 @@ def main():
         "--repository-names",
         out("repository_name"),
     )["repositories"][0]
-    if repository.get("imageTagMutability") != "IMMUTABLE":
-        fail("repository tags are mutable")
+    expect(repository.get("imageTagMutability"), "IMMUTABLE", "repository tags")
     scanning = repository.get("imageScanningConfiguration") or {}
-    if scanning.get("scanOnPush") is not True:
-        fail("scan on push is off")
+    expect(scanning.get("scanOnPush"), True, "scan on push")
 
-    block = aws(
-        "s3api",
-        "get-public-access-block",
-        "--bucket",
-        out("bucket_name"),
-    )["PublicAccessBlockConfiguration"]
+    bucket = out("bucket_name")
+    block = aws("s3api", "get-public-access-block", "--bucket", bucket)[
+        "PublicAccessBlockConfiguration"
+    ]
     for key in (
         "BlockPublicAcls",
         "IgnorePublicAcls",
         "BlockPublicPolicy",
         "RestrictPublicBuckets",
     ):
-        if block.get(key) is not True:
-            fail(f"public access block {key} is not set")
+        expect(block.get(key), True, f"public access block {key}")
+    expect(
+        aws("s3api", "get-bucket-versioning", "--bucket", bucket).get("Status"),
+        "Enabled",
+        "versioning",
+    )
+    rules = aws("s3api", "get-bucket-encryption", "--bucket", bucket)[
+        "ServerSideEncryptionConfiguration"
+    ]["Rules"]
+    algorithm = rules[0]["ApplyServerSideEncryptionByDefault"]
+    expect(algorithm.get("SSEAlgorithm"), "aws:kms", "bucket encryption")
+    if "key/" not in algorithm.get("KMSMasterKeyID", ""):
+        fail("bucket encryption key is missing")
 
     trust = as_doc(
         aws("iam", "get-role", "--role-name", out("role_name"))["Role"][
@@ -93,15 +109,20 @@ def main():
     statements = trust.get("Statement") or []
     if len(statements) != 1:
         fail("trust has more than one statement")
-    statement = statements[0]
-    condition = statement.get("Condition") or {}
+    condition = statements[0].get("Condition") or {}
     if set(condition) != {"StringEquals"}:
         fail("trust condition is not an exact match")
     equals = condition["StringEquals"]
-    if equals.get("token.actions.githubusercontent.com:sub") != out("subject"):
-        fail("trust subject is not this repository and main")
-    if equals.get("token.actions.githubusercontent.com:aud") != "sts.amazonaws.com":
-        fail("trust audience is wrong")
+    expect(
+        equals.get("token.actions.githubusercontent.com:sub"),
+        out("subject"),
+        "trust subject",
+    )
+    expect(
+        equals.get("token.actions.githubusercontent.com:aud"),
+        "sts.amazonaws.com",
+        "trust audience",
+    )
     if "*" in json.dumps(trust):
         fail("trust contains a wildcard")
 
@@ -115,7 +136,6 @@ def main():
             out("policy_name"),
         )["PolicyDocument"]
     )
-    bucket = out("bucket_name")
     allowed = {
         repository["repositoryArn"],
         f"arn:aws:s3:::{bucket}",
@@ -132,6 +152,272 @@ def main():
             fail("policy names a resource outside the registry and the bucket")
         if any("*" in action for action in actions):
             fail("policy action is a wildcard")
+
+    aliases = aws("kms", "list-aliases")["Aliases"]
+    alias = next(item for item in aliases if item["AliasName"] == f"alias/{NAME}")
+    key_id = alias["TargetKeyId"]
+    rotation = aws("kms", "get-key-rotation-status", "--key-id", key_id)
+    expect(rotation.get("KeyRotationEnabled"), True, "key rotation")
+    key_policy = as_doc(
+        aws("kms", "get-key-policy", "--key-id", key_id, "--policy-name", "default")[
+            "Policy"
+        ]
+    )
+    key_statements = key_policy.get("Statement") or []
+    if len(key_statements) != 1:
+        fail("key policy has more than the root statement")
+    principal = key_statements[0].get("Principal", {}).get("AWS")
+    expect(principal, f"arn:aws:iam::{ACCOUNT}:root", "key policy principal")
+
+    queue_url = aws("sqs", "get-queue-url", "--queue-name", NAME)["QueueUrl"]
+    queue = aws(
+        "sqs",
+        "get-queue-attributes",
+        "--queue-url",
+        queue_url,
+        "--attribute-names",
+        "All",
+    )["Attributes"]
+    expect(queue.get("MessageRetentionPeriod"), "86400", "queue retention")
+    expect(queue.get("VisibilityTimeout"), "30", "queue visibility")
+    expect(queue.get("SqsManagedSseEnabled"), "true", "queue encryption")
+    redrive = json.loads(queue["RedrivePolicy"])
+    expect(redrive.get("maxReceiveCount"), 5, "dead letter count")
+    if not str(redrive.get("deadLetterTargetArn", "")).endswith(f"{NAME}-dead"):
+        fail("dead letter queue is wrong")
+    queue_policy = as_doc(queue["Policy"])
+    if len(queue_policy.get("Statement") or []) != 2:
+        fail("queue policy does not name the topic and the rule")
+    for item in queue_policy["Statement"]:
+        if item.get("Resource", "").endswith("*") or item.get("Resource") == "*":
+            fail("queue policy resource is a wildcard")
+
+    topic_arn = aws("sns", "list-topics")["Topics"][0]["TopicArn"]
+    topic = aws("sns", "get-topic-attributes", "--topic-arn", topic_arn)["Attributes"]
+    expect(topic.get("KmsMasterKeyId"), key_id, "topic key")
+    subs = aws("sns", "list-subscriptions-by-topic", "--topic-arn", topic_arn)[
+        "Subscriptions"
+    ]
+    if len(subs) != 1 or not subs[0]["Endpoint"].endswith(NAME):
+        fail("subscription does not point at the queue")
+    raw = aws(
+        "sns",
+        "get-subscription-attributes",
+        "--subscription-arn",
+        subs[0]["SubscriptionArn"],
+    )["Attributes"]
+    expect(raw.get("RawMessageDelivery"), "true", "raw delivery")
+
+    table = aws("dynamodb", "describe-table", "--table-name", NAME)["Table"]
+    expect(table["BillingModeSummary"]["BillingMode"], "PAY_PER_REQUEST", "table billing")
+    expect(table["KeySchema"], [{"AttributeName": "id", "KeyType": "HASH"}], "table key")
+
+    summary = aws(
+        "kinesis", "describe-stream-summary", "--stream-name", NAME
+    )["StreamDescriptionSummary"]
+    expect(summary["StreamModeDetails"]["StreamMode"], "ON_DEMAND", "stream mode")
+    expect(summary.get("RetentionPeriodHours"), 48, "stream retention")
+
+    firehose = aws(
+        "firehose",
+        "describe-delivery-stream",
+        "--delivery-stream-name",
+        NAME,
+    )["DeliveryStreamDescription"]
+    destination = firehose["Destinations"][0]["ExtendedS3DestinationDescription"]
+    expect(destination.get("BucketARN"), f"arn:aws:s3:::{bucket}", "delivery bucket")
+    expect(destination.get("Prefix"), "firehose/", "delivery prefix")
+
+    groups = aws(
+        "logs",
+        "describe-log-groups",
+        "--log-group-name-prefix",
+        f"/{NAME}/app",
+    )["logGroups"]
+    expect(groups[0].get("retentionInDays"), 14, "log retention")
+
+    rule = aws(
+        "events",
+        "describe-rule",
+        "--name",
+        NAME,
+        "--event-bus-name",
+        NAME,
+    )
+    expect(rule.get("State"), "ENABLED", "rule state")
+    expect(json.loads(rule["EventPattern"]), {"source": [NAME]}, "rule pattern")
+
+    schedule = aws("scheduler", "get-schedule", "--name", NAME)
+    expect(schedule.get("ScheduleExpression"), "rate(1 hour)", "schedule")
+    expect(schedule["Target"]["Arn"].endswith(NAME), True, "schedule target")
+
+    pipe = aws("pipes", "describe-pipe", "--name", NAME)
+    expect(pipe.get("CurrentState"), "RUNNING", "pipe")
+    expect(pipe.get("Source", "").endswith(f"{NAME}-pipe"), True, "pipe source")
+    expect(pipe.get("Target"), topic_arn, "pipe target")
+    pipe_policy = as_doc(
+        aws(
+            "iam",
+            "get-role-policy",
+            "--role-name",
+            f"{NAME}-pipes",
+            "--policy-name",
+            "poll-and-publish",
+        )["PolicyDocument"]
+    )
+    for item in pipe_policy.get("Statement") or []:
+        if "*" in as_list(item.get("Resource")):
+            fail("pipe policy resource is a wildcard")
+
+    function = aws("lambda", "get-function-configuration", "--function-name", NAME)
+    expect(function.get("Runtime"), "python3.12", "function runtime")
+    expect(function.get("Handler"), "index.handler", "function handler")
+    expect(function.get("Timeout"), 3, "function timeout")
+    expect(function.get("MemorySize"), 128, "function memory")
+
+    machine = aws(
+        "stepfunctions",
+        "describe-state-machine",
+        "--state-machine-arn",
+        f"arn:aws:states:us-east-1:{ACCOUNT}:stateMachine:{NAME}",
+    )
+    expect(machine.get("type"), "STANDARD", "state machine type")
+    expect(json.loads(machine["definition"])["StartAt"], "Done", "state machine")
+
+    cluster = aws("ecs", "describe-clusters", "--clusters", NAME)["clusters"][0]
+    expect(cluster.get("status"), "ACTIVE", "cluster")
+    expect(cluster.get("activeServicesCount"), 0, "cluster services")
+
+    commit = aws(
+        "codecommit", "get-repository", "--repository-name", NAME
+    )["repositoryMetadata"]
+    expect(commit.get("repositoryName"), NAME, "codecommit")
+
+    deploy = aws("deploy", "get-application", "--application-name", NAME)["application"]
+    expect(deploy.get("computePlatform"), "Lambda", "codedeploy")
+
+    project = aws("codebuild", "batch-get-projects", "--names", NAME)["projects"][0]
+    expect(project["source"].get("type"), "NO_SOURCE", "codebuild source")
+    expect(project["environment"].get("image"), "aws/codebuild/standard:7.0", "codebuild image")
+
+    pipeline = aws("codepipeline", "get-pipeline", "--name", NAME)["pipeline"]
+    expect(pipeline["artifactStore"].get("location"), bucket, "pipeline bucket")
+    expect([stage["name"] for stage in pipeline["stages"]], ["Source", "Build"], "pipeline stages")
+
+    trails = aws("cloudtrail", "describe-trails", "--trail-name-list", NAME)["trailList"]
+    expect(trails[0].get("S3BucketName"), f"{NAME}-trail", "trail bucket")
+    expect(trails[0].get("LogFileValidationEnabled"), True, "trail validation")
+    trail_block = aws(
+        "s3api", "get-public-access-block", "--bucket", f"{NAME}-trail"
+    )["PublicAccessBlockConfiguration"]
+    for key in (
+        "BlockPublicAcls",
+        "IgnorePublicAcls",
+        "BlockPublicPolicy",
+        "RestrictPublicBuckets",
+    ):
+        expect(trail_block.get(key), True, f"trail block {key}")
+
+    detectors = aws("guardduty", "list-detectors")["DetectorIds"]
+    if len(detectors) != 1:
+        fail("guardduty detector count")
+    detector = aws("guardduty", "get-detector", "--detector-id", detectors[0])
+    expect(detector.get("Status"), "ENABLED", "guardduty")
+    expect(detector.get("FindingPublishingFrequency"), "SIX_HOURS", "guardduty frequency")
+
+    analyzers = aws("accessanalyzer", "list-analyzers")["analyzers"]
+    expect(analyzers[0].get("type"), "ACCOUNT", "analyzer")
+
+    acls = aws("wafv2", "list-web-acls", "--scope", "REGIONAL")["WebACLs"]
+    acl = next(item for item in acls if item["Name"] == NAME)
+    web_acl = aws(
+        "wafv2",
+        "get-web-acl",
+        "--scope",
+        "REGIONAL",
+        "--name",
+        acl["Name"],
+        "--id",
+        acl["Id"],
+    )["WebACL"]
+    if "Allow" not in web_acl.get("DefaultAction", {}):
+        fail("web acl default action")
+
+    zones = aws("route53", "list-hosted-zones")["HostedZones"]
+    zone = next(item for item in zones if item["Name"] == f"{DNS}.")
+    expect(zone["Config"].get("PrivateZone"), False, "zone")
+    expect(zone["Config"].get("Comment"), "Not a delegated zone.", "zone comment")
+
+    certificates = aws("acm", "list-certificates")["CertificateSummaryList"]
+    certificate = next(item for item in certificates if item["DomainName"] == DNS)
+    expect(certificate.get("KeyAlgorithm"), "RSA-2048", "certificate key")
+
+    identities = aws(
+        "ses",
+        "get-identity-verification-attributes",
+        "--identities",
+        DNS,
+    )["VerificationAttributes"]
+    if DNS not in identities:
+        fail("ses identity is missing")
+
+    pools = aws("cognito-idp", "list-user-pools", "--max-results", "10")["UserPools"]
+    pool = aws("cognito-idp", "describe-user-pool", "--user-pool-id", pools[0]["Id"])[
+        "UserPool"
+    ]
+    expect(pool["Policies"]["PasswordPolicy"]["MinimumLength"], 14, "pool password")
+
+    applications = aws("appconfig", "list-applications")["Items"]
+    application = next(item for item in applications if item["Name"] == NAME)
+    environments = aws(
+        "appconfig", "list-environments", "--application-id", application["Id"]
+    )["Items"]
+    if not any(item["Name"] == NAME for item in environments):
+        fail("appconfig environment")
+
+    namespaces = aws("servicediscovery", "list-namespaces")["Namespaces"]
+    namespace = next(item for item in namespaces if item["Name"] == NAME)
+    expect(namespace.get("Type"), "HTTP", "namespace")
+
+    registries = aws("schemas", "list-registries")["Registries"]
+    if not any(item["RegistryName"] == NAME for item in registries):
+        fail("schema registry")
+
+    groups = aws("xray", "get-groups")["Groups"]
+    xray = next(item for item in groups if item["GroupName"] == NAME)
+    expect(xray.get("FilterExpression"), 'service("terraform-emulator")', "xray filter")
+
+    filesystems = aws("efs", "describe-file-systems")["FileSystems"]
+    expect(filesystems[0].get("Encrypted"), True, "file system")
+
+    secret = aws("secretsmanager", "describe-secret", "--secret-id", NAME)
+    expect(secret.get("Name"), NAME, "secret")
+
+    services = {
+        f"{NAME}-states": "states.amazonaws.com",
+        f"{NAME}-lambda": "lambda.amazonaws.com",
+        f"{NAME}-firehose": "firehose.amazonaws.com",
+        f"{NAME}-scheduler": "scheduler.amazonaws.com",
+        f"{NAME}-pipes": "pipes.amazonaws.com",
+        f"{NAME}-codebuild": "codebuild.amazonaws.com",
+        f"{NAME}-codepipeline": "codepipeline.amazonaws.com",
+    }
+    for role_name, principal in services.items():
+        document = as_doc(
+            aws("iam", "get-role", "--role-name", role_name)["Role"][
+                "AssumeRolePolicyDocument"
+            ]
+        )
+        role_statements = document.get("Statement") or []
+        if len(role_statements) != 1:
+            fail(f"{role_name} trust has more than one statement")
+        expect(
+            role_statements[0].get("Principal", {}).get("Service"),
+            principal,
+            f"{role_name} principal",
+        )
+        if "Condition" in role_statements[0] or "*" in json.dumps(document):
+            fail(f"{role_name} trust is wider than one service")
 
     print("shape ok")
 

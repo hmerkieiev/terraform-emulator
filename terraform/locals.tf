@@ -15,4 +15,17 @@ locals {
   # Immutable subject GitHub issues for this repository. Repositories
   # created after the 2026-07-15 rollout carry the owner id and the repo id.
   subject = "repo:hmerkieiev@22146499/terraform-emulator@1455920882:ref:refs/heads/main"
+
+  dns_name = "terraform-emulator.test"
+
+  # Roles the other resources name. Each trust is one service, with no condition.
+  service_roles = {
+    states       = "states.amazonaws.com"
+    lambda       = "lambda.amazonaws.com"
+    firehose     = "firehose.amazonaws.com"
+    scheduler    = "scheduler.amazonaws.com"
+    pipes        = "pipes.amazonaws.com"
+    codebuild    = "codebuild.amazonaws.com"
+    codepipeline = "codepipeline.amazonaws.com"
+  }
 }
