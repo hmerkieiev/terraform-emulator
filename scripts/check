@@ -17,6 +17,9 @@ ROOT = Path(__file__).resolve().parent.parent
 NAME = "terraform-emulator"
 DNS = "terraform-emulator.test"
 ACCOUNT = "000000000000"
+# The contract subject. The widened stack must not get to choose it.
+SUBJECT = "repo:hmerkieiev@22146499/terraform-emulator@1455920882:ref:refs/heads/main"
+problems = []
 
 
 def aws(*args):
@@ -53,10 +56,29 @@ def expect(got, want, label):
         fail(f"{label}: got {got!r}")
 
 
+def note(message):
+    problems.append(message)
+
+
+def check(got, want, label):
+    if got != want:
+        note(f"{label}: got {got!r}")
+
+
+def condition_values(condition, key):
+    found = []
+    for body in condition.values():
+        if isinstance(body, dict) and key in body:
+            found.append(body[key])
+    return found
+
+
 def main():
+    rejected = len(sys.argv) > 1 and sys.argv[1] == "rejected"
+    stack = ROOT / "terraform" / ("rejected" if rejected else "")
     outputs = json.loads(
         subprocess.check_output(
-            ["terraform", f"-chdir={ROOT / 'terraform'}", "output", "-json"],
+            ["terraform", f"-chdir={stack}", "output", "-json"],
             text=True,
         )
     )
@@ -65,7 +87,7 @@ def main():
         return outputs[name]["value"]
 
     identity = aws("sts", "get-caller-identity")
-    expect(identity.get("Account"), ACCOUNT, "caller")
+    check(identity.get("Account"), ACCOUNT, "caller")
 
     repository = aws(
         "ecr",
@@ -73,9 +95,9 @@ def main():
         "--repository-names",
         out("repository_name"),
     )["repositories"][0]
-    expect(repository.get("imageTagMutability"), "IMMUTABLE", "repository tags")
+    check(repository.get("imageTagMutability"), "IMMUTABLE", "repository tags")
     scanning = repository.get("imageScanningConfiguration") or {}
-    expect(scanning.get("scanOnPush"), True, "scan on push")
+    check(scanning.get("scanOnPush"), True, "scan on push")
 
     bucket = out("bucket_name")
     block = aws("s3api", "get-public-access-block", "--bucket", bucket)[
@@ -87,19 +109,7 @@ def main():
         "BlockPublicPolicy",
         "RestrictPublicBuckets",
     ):
-        expect(block.get(key), True, f"public access block {key}")
-    expect(
-        aws("s3api", "get-bucket-versioning", "--bucket", bucket).get("Status"),
-        "Enabled",
-        "versioning",
-    )
-    rules = aws("s3api", "get-bucket-encryption", "--bucket", bucket)[
-        "ServerSideEncryptionConfiguration"
-    ]["Rules"]
-    algorithm = rules[0]["ApplyServerSideEncryptionByDefault"]
-    expect(algorithm.get("SSEAlgorithm"), "aws:kms", "bucket encryption")
-    if "key/" not in algorithm.get("KMSMasterKeyID", ""):
-        fail("bucket encryption key is missing")
+        check(block.get(key), True, f"public access block {key}")
 
     trust = as_doc(
         aws("iam", "get-role", "--role-name", out("role_name"))["Role"][
@@ -108,23 +118,19 @@ def main():
     )
     statements = trust.get("Statement") or []
     if len(statements) != 1:
-        fail("trust has more than one statement")
-    condition = statements[0].get("Condition") or {}
-    if set(condition) != {"StringEquals"}:
-        fail("trust condition is not an exact match")
-    equals = condition["StringEquals"]
-    expect(
-        equals.get("token.actions.githubusercontent.com:sub"),
-        out("subject"),
-        "trust subject",
-    )
-    expect(
-        equals.get("token.actions.githubusercontent.com:aud"),
-        "sts.amazonaws.com",
-        "trust audience",
-    )
+        note("trust has more than one statement")
+    else:
+        condition = statements[0].get("Condition") or {}
+        if set(condition) != {"StringEquals"}:
+            note("trust condition is not an exact match")
+        subs = condition_values(condition, "token.actions.githubusercontent.com:sub")
+        auds = condition_values(condition, "token.actions.githubusercontent.com:aud")
+        if subs != [SUBJECT]:
+            note(f"trust subject: got {subs!r}")
+        if auds != ["sts.amazonaws.com"]:
+            note(f"trust audience: got {auds!r}")
     if "*" in json.dumps(trust):
-        fail("trust contains a wildcard")
+        note("trust contains a wildcard")
 
     policy = as_doc(
         aws(
@@ -146,12 +152,34 @@ def main():
         resources = as_list(item.get("Resource"))
         if resources == ["*"]:
             if actions != ["ecr:GetAuthorizationToken"]:
-                fail("wildcard resource is not limited to the registry login")
+                note("wildcard resource is not limited to the registry login")
             continue
         if not set(resources) <= allowed:
-            fail("policy names a resource outside the registry and the bucket")
+            note("policy names a resource outside the registry and the bucket")
         if any("*" in action for action in actions):
-            fail("policy action is a wildcard")
+            note("policy action is a wildcard")
+
+    if problems:
+        print("\n".join(problems), file=sys.stderr)
+        raise SystemExit(1)
+    if rejected:
+        print("shape ok")
+        return
+
+    if out("subject") != SUBJECT:
+        fail("stack subject is not the contract")
+    expect(
+        aws("s3api", "get-bucket-versioning", "--bucket", bucket).get("Status"),
+        "Enabled",
+        "versioning",
+    )
+    rules = aws("s3api", "get-bucket-encryption", "--bucket", bucket)[
+        "ServerSideEncryptionConfiguration"
+    ]["Rules"]
+    algorithm = rules[0]["ApplyServerSideEncryptionByDefault"]
+    expect(algorithm.get("SSEAlgorithm"), "aws:kms", "bucket encryption")
+    if "key/" not in algorithm.get("KMSMasterKeyID", ""):
+        fail("bucket encryption key is missing")
 
     aliases = aws("kms", "list-aliases")["Aliases"]
     alias = next(item for item in aliases if item["AliasName"] == f"alias/{NAME}")

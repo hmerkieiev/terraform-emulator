@@ -14,5 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # No cloud credentials in this job. The script refuses any other caller.
-      - name: Apply, then reject a widened shape
+      - name: Apply
         run: bash scripts/apply
+      - name: Reject the widened stack
+        run: bash scripts/reject

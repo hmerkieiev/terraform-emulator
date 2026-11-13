@@ -1,6 +1,6 @@
 # terraform-emulator
 
-A local stand for one idea: a small Terraform stack can be applied to AWS Emulator, and the check refuses the shape when a bucket is opened or the trust grows a wildcard.
+A local stand for one idea: a small Terraform stack can be applied to AWS Emulator, and a second stack that widens the same resources is refused.
 
 This is a portfolio example. It is not an employer's account, and it contains no account identifier. The only account the apply talks to is the emulator's `000000000000`.
 
@@ -28,15 +28,22 @@ Glue is left out. Creating the database works, and the provider then reads its t
 
 Two fields are ignored on later plans. The emulator reports an unset DynamoDB on-demand maximum as `-1`, and it fills a Kinesis warm throughput the configuration does not set.
 
+## The widened stack
+
+`terraform/rejected` is the registry, the bucket, and the role, with the mistakes written in the files. Tags are mutable, and scan on push is off. The public access block is open. The trust is `StringLike` with a wildcard principal, subject, and audience. The policy allows `s3:GetObject` on `*`.
+
+`scripts/reject` applies that stack to a fresh emulator. The apply succeeds. The check has to fail, and the failure has to name each mistake. The emulator does not refuse the apply.
+
 ## Run
 
 Docker on macOS. The Linux package on Linux. Terraform 1.10 or newer, the AWS CLI, and Python 3.
 
 ```sh
 scripts/apply
+scripts/reject
 ```
 
-The script points the AWS CLI and Terraform at `https://127.0.0.1:9297`, refuses to continue unless the caller is the emulator, applies the stack, reads it back, and plans again. The second plan has to be empty. It then opens the bucket and puts a wildcard on the role. The check has to fail for each of those, with the reason named. The emulator still accepted the writes. The same script is the CI job. That job has no cloud credentials.
+`scripts/apply` points the AWS CLI and Terraform at `https://127.0.0.1:9297`, refuses to continue unless the caller is the emulator, applies the stack, reads it back, and plans again. The second plan has to be empty. Both scripts are the CI job. That job has no cloud credentials.
 
 ## License
 

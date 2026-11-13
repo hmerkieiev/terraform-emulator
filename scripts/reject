@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Apply the widened stack. The emulator accepts it. The check has to name each mistake.
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+cd "$ROOT"
+# shellcheck source=emulator
+. "${ROOT}/scripts/emulator"
+trap cleanup EXIT
+
+start_emulator
+require_account
+install_terraform
+terraform -chdir=terraform/rejected init -input=false
+terraform -chdir=terraform/rejected apply -input=false -auto-approve
+
+set +e
+out=$(python3 scripts/check rejected 2>&1)
+code=$?
+set -e
+if [[ "${code}" -eq 0 ]]; then
+  echo "widened stack was accepted" >&2
+  exit 1
+fi
+
+wanted=(
+  "repository tags"
+  "scan on push"
+  "public access block"
+  "trust condition is not an exact match"
+  "trust subject"
+  "trust audience"
+  "trust contains a wildcard"
+  "wildcard resource is not limited to the registry login"
+)
+for want in "${wanted[@]}"; do
+  if [[ "${out}" != *"${want}"* ]]; then
+    printf '%s\n' "${out}" >&2
+    echo "missing rejection: ${want}" >&2
+    exit 1
+  fi
+done
+
+echo "rejected stack refused"
