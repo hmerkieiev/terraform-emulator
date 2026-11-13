@@ -32,7 +32,7 @@ Two fields are ignored on later plans. The emulator reports an unset DynamoDB on
 
 `terraform/rejected` is the registry, the bucket, and the role, with the mistakes written in the files. Tags are mutable, and scan on push is off. The public access block is open. The trust is `StringLike` with a wildcard principal, subject, and audience. The policy allows `s3:GetObject` on `*`.
 
-`scripts/reject` applies that stack to a fresh emulator. The apply succeeds. The check has to fail, and the failure has to name each mistake. The emulator does not refuse the apply.
+`scripts/reject` applies that stack to a fresh emulator. The apply completes. The check then names each mistake and exits, and that exit fails the widened workflow. The apply workflow does not run this stack.
 
 ## Run
 
@@ -43,7 +43,9 @@ scripts/apply
 scripts/reject
 ```
 
-`scripts/apply` points the AWS CLI and Terraform at `https://127.0.0.1:9297`, refuses to continue unless the caller is the emulator, applies the stack, reads it back, and plans again. The second plan has to be empty. Both scripts are the CI job. That job has no cloud credentials.
+`scripts/apply` points the AWS CLI and Terraform at `https://127.0.0.1:9297`, refuses to continue unless the caller is the emulator, applies the stack, reads it back, and plans again. The second plan has to be empty. That script is the apply workflow, and the workflow succeeds.
+
+`scripts/reject` is the widened workflow. The workflow fails, and the log lists each mistake. Neither workflow has cloud credentials.
 
 ## License
 

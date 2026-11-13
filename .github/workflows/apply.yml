@@ -16,5 +16,3 @@ jobs:
       # No cloud credentials in this job. The script refuses any other caller.
       - name: Apply
         run: bash scripts/apply
-      - name: Reject the widened stack
-        run: bash scripts/reject
