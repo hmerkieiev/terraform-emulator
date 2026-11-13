@@ -1,6 +1,6 @@
 # terraform-emulator
 
-A local stand for one idea: a small Terraform stack can be applied to AWS Emulator, and the resources can be read back in the shape that was asked for.
+A local stand for one idea: a small Terraform stack can be applied to AWS Emulator, and the check refuses the shape when a bucket is opened or the trust grows a wildcard.
 
 This is a portfolio example. It is not an employer's account, and it contains no account identifier. The only account the apply talks to is the emulator's `000000000000`.
 
@@ -36,7 +36,7 @@ Docker on macOS. The Linux package on Linux. Terraform 1.10 or newer, the AWS CL
 scripts/apply
 ```
 
-The script points the AWS CLI and Terraform at `https://127.0.0.1:9297`, refuses to continue unless the caller is the emulator, applies the stack, reads it back, and plans again. The second plan has to be empty. The same script is the CI job. That job has no cloud credentials.
+The script points the AWS CLI and Terraform at `https://127.0.0.1:9297`, refuses to continue unless the caller is the emulator, applies the stack, reads it back, and plans again. The second plan has to be empty. It then opens the bucket and puts a wildcard on the role. The check has to fail for each of those, with the reason named. The emulator still accepted the writes. The same script is the CI job. That job has no cloud credentials.
 
 ## License
 

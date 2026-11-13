@@ -173,9 +173,64 @@ if [[ "${account}" != "000000000000" ]]; then
   exit 1
 fi
 
+expect_reject() {
+  local want="$1"
+  local out code
+  set +e
+  out=$(python3 scripts/check 2>&1)
+  code=$?
+  set -e
+  if [[ "${code}" -eq 0 ]]; then
+    echo "widened shape was accepted" >&2
+    exit 1
+  fi
+  if [[ "${out}" != *"${want}"* ]]; then
+    printf '%s\n' "${out}" >&2
+    echo "check failed for a different reason" >&2
+    exit 1
+  fi
+  echo "rejected: ${want}"
+}
+
 install_terraform
 terraform -chdir=terraform init -input=false
 terraform -chdir=terraform apply -input=false -auto-approve
 python3 scripts/check
 terraform -chdir=terraform plan -input=false -detailed-exitcode
 echo "apply ok"
+
+# The emulator accepts both writes. The check is what refuses them.
+bucket=$(terraform -chdir=terraform output -raw bucket_name)
+role=$(terraform -chdir=terraform output -raw role_name)
+subject=$(terraform -chdir=terraform output -raw subject)
+
+aws s3api put-public-access-block \
+  --bucket "${bucket}" \
+  --public-access-block-configuration BlockPublicAcls=false,IgnorePublicAcls=false,BlockPublicPolicy=false,RestrictPublicBuckets=false
+expect_reject "public access block"
+
+aws s3api put-public-access-block \
+  --bucket "${bucket}" \
+  --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
+policy=$(SUBJECT="${subject}" python3 - << 'PY'
+import json, os
+print(json.dumps({
+    "Version": "2012-10-17",
+    "Statement": [{
+        "Effect": "Allow",
+        "Principal": {"Federated": "*"},
+        "Action": "sts:AssumeRoleWithWebIdentity",
+        "Condition": {
+            "StringEquals": {
+                "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+                "token.actions.githubusercontent.com:sub": os.environ["SUBJECT"],
+            }
+        },
+    }],
+}))
+PY
+)
+aws iam update-assume-role-policy --role-name "${role}" --policy-document "${policy}"
+expect_reject "trust contains a wildcard"
+echo "reject ok"
