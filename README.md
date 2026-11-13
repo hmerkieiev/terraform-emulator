@@ -2,11 +2,11 @@
 
 A local stand for one idea: a small Terraform stack can be applied to AWS Emulator, and a second stack that widens the same resources is refused.
 
-This is a portfolio example. It is not an employer's account, and it contains no account identifier. The only account the apply talks to is the emulator's `000000000000`.
+This is a portfolio example. It is not an employer's account, and it contains no account identifier. The only account the apply talks to is the emulator's `000000000000`. [AWS Emulator](https://github.com/aws/aws-emulator) is the local API.
+
+The `apply` workflow has to pass. The `widened (expected failure)` workflow fails on every push. That failure lists each mistake in `terraform/rejected`. A red mark on the commit is that refusal.
 
 ## What it creates
-
-The only account is the emulator's `000000000000`.
 
 A registry with immutable tags. A bucket that blocks public access, versions objects, and encrypts them with a key that rotates. A second bucket holds a trail, also closed, with log-file validation. The CI role trusts this repository on `main`. Its policy names that registry and that bucket. `ecr:GetAuthorizationToken` is the one action AWS requires on `*`. The key policy's one statement is the root of the emulator account, because a key policy has no key ARN until the key exists.
 
@@ -32,7 +32,7 @@ Two fields are ignored on later plans. The emulator reports an unset DynamoDB on
 
 `terraform/rejected` is the registry, the bucket, and the role, with the mistakes written in the files. Tags are mutable, and scan on push is off. The public access block is open. The trust is `StringLike` with a wildcard principal, subject, and audience. The policy allows `s3:GetObject` on `*`.
 
-`scripts/reject` applies that stack to a fresh emulator. The apply completes. The check then names each mistake and exits, and that exit fails the widened workflow. The apply workflow does not run this stack.
+`scripts/reject` applies that stack to a fresh emulator. The apply completes. The check then names each mistake and exits, and that exit fails the `widened (expected failure)` workflow. The apply workflow does not run this stack.
 
 ## Run
 
@@ -45,7 +45,7 @@ scripts/reject
 
 `scripts/apply` points the AWS CLI and Terraform at `https://127.0.0.1:9297`, refuses to continue unless the caller is the emulator, applies the stack, reads it back, and plans again. The second plan has to be empty. That script is the apply workflow, and the workflow succeeds.
 
-`scripts/reject` is the widened workflow. The workflow fails, and the log lists each mistake. Neither workflow has cloud credentials.
+`scripts/reject` is the `widened (expected failure)` workflow. The workflow fails, and the log lists each mistake. Neither workflow has cloud credentials.
 
 ## License
 

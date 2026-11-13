@@ -1,4 +1,4 @@
-name: widened
+name: widened (expected failure)
 
 on:
   push:
